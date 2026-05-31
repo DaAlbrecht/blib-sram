@@ -1,4 +1,4 @@
-package io.hammerhead.karooexttemplate.theme
+package io.hammerhead.blibsram.theme
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
