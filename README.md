@@ -1,19 +1,19 @@
-# Karoo Extensions (Template)
+# blibsram Karoo 2 Extension
 
-Template repository for empty app with Karoo Extension service.
+This extension enables control of a Karoo device using the bonus buttons available on SRAM Force and RED groupsets.
 
-## Instructions
+> [!NOTE]
+> This extension is designed exclusively for the Karoo 2.
+> Newer Karoo models should support native integration and not require this workaround.
 
-1. Clone this repository or "Use this template" on Github
-2. Update namespace in `build.gradle.kt` and `app/src/main/kotlin`
-3. Replace "template" values in `strings.xml`, `extension_info.xml`, `AndroidManifest.xml`
-4. Implement Android app experience (in `MainActivity.kt`)
-5. Implement extension functionality in `TemplateExtension.kt`
+## Features
 
-## Links
+- Map SRAM bonus buttons to:
+  - Top-right button (page forward)
+  - Top-left button (page back)
 
-[Documentation](https://hammerheadnav.github.io/karoo-ext/index.html)
+  
+## How can I install the app?
 
-[karoo-ext source](https://github.com/hammerheadnav/karoo-ext)
-
-[Sample](https://github.com/hammerheadnav/karoo-ext/tree/master/app)
+1. Find the link to the `blibsram` APK file from the latest [release page](https://github.com/DaAlbrecht/blib-sram/releases)
+2. Install via `adb install <path to apk>`
