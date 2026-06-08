@@ -9,36 +9,45 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.retry
 
 class BlibSramExtension : KarooExtension("blibSram", "1.0") {
 
-    enum class BlibAction {
-        LEFT_PRESS,
-        RIGHT_PRESS
+    companion object {
+        private const val TAG = "BlibSramExtension"
+        private const val PREFS_NAME = "blib_prefs"
+        private const val KEY_LEFT_ACTION = "left_action"
+        private const val KEY_RIGHT_ACTION = "right_action"
+        private const val DEFAULT_LEFT = "Page Left"
+        private const val DEFAULT_RIGHT = "Page Right"
     }
-    private val tag = "BlibSramExtension"
 
     private val extensionScope = CoroutineScope(Dispatchers.IO)
     private lateinit var karooSystem: KarooSystemService
-    private var logcatProcess: Process? = null
     private var snifferJob: Job? = null
     private var lastEventCount = -1
     private var currentRideState: RideState = RideState.Idle
     private var rideStateConsumerId: String? = null
 
-    private val prefs by lazy { applicationContext.getSharedPreferences("blib_prefs", MODE_PRIVATE) }
+    private var lastActionTime = 0L
+
+    private val antParser = AntParser { lastEventCount }
+
+    private val prefs by lazy { applicationContext.getSharedPreferences(PREFS_NAME, MODE_PRIVATE) }
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(tag, "Extension Created")
-
         karooSystem = KarooSystemService(applicationContext)
         karooSystem.connect { connected ->
-            Log.d(tag, "BlibSram connected: $connected")
             if (connected) {
                 rideStateConsumerId = karooSystem.addConsumer<RideState> { rideState ->
-                    Log.d(tag, "Ride state changed: $rideState")
+                    Log.d(TAG, "Ride state changed: $rideState")
                     currentRideState = rideState
                     updateSnifferState()
                 }
@@ -48,7 +57,6 @@ class BlibSramExtension : KarooExtension("blibSram", "1.0") {
     }
 
     override fun onDestroy() {
-        Log.d(tag, "Extension Destroyed")
         rideStateConsumerId?.let { karooSystem.removeConsumer(it) }
         stopLogcatSniffer()
         karooSystem.disconnect()
@@ -57,6 +65,7 @@ class BlibSramExtension : KarooExtension("blibSram", "1.0") {
     }
 
     private fun updateSnifferState() {
+        Log.d(TAG, "Updating sniffer state: $currentRideState")
         if (currentRideState !is RideState.Idle) {
             startLogcatSniffer()
         } else {
@@ -64,82 +73,62 @@ class BlibSramExtension : KarooExtension("blibSram", "1.0") {
         }
     }
 
-    private fun stopLogcatSniffer() {
-        if (logcatProcess != null || snifferJob != null) {
-            Log.d(tag, "Stopping logcat sniffer")
-            logcatProcess?.destroy()
-            logcatProcess = null
-            snifferJob?.cancel()
-            snifferJob = null
-        }
-    }
-
     private fun startLogcatSniffer() {
-        if (snifferJob?.isActive == true) {
-            Log.d(tag, "Logcat sniffer already running")
-            return
-        }
-        snifferJob = extensionScope.launch(Dispatchers.IO) {
-            try {
-                Log.d(tag, "Starting logcat sniffer")
-                // Use logcat native filtering to minimize CPU ussage.
-                // This "subscribes" only to Broadcast Data (4E) on Page 2 (02).
-                val cmd = "logcat -T 1 -b system -b radio -v raw -s antradio:V -e \"Rx \\[A4\\].*4E.*02\""
-                logcatProcess = Runtime.getRuntime().exec(cmd)
-                val reader = logcatProcess?.inputStream?.bufferedReader() ?: return@launch
-                Log.d(tag, "Logcat sniffer started")
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    parseAntPacket(line)?.let { action ->
-                        handleBlibAction(action)
-                    }
+        if (snifferJob?.isActive == true) return
+
+        snifferJob = logcatFlow()
+            .onEach { line ->
+                antParser.parseAntPacket(line)?.let { result ->
+                    Log.d(TAG, "Parsed action: ${result.action} (EC: ${result.eventCount})")
+                    lastEventCount = result.eventCount
+                    handleBlibAction(result.action)
                 }
-            } catch (e: Exception) {
-                Log.e(tag, "Logcat sniffer error: ${e.message}")
-            } finally {
-                logcatProcess?.destroy()
-                logcatProcess = null
-                Log.d(tag, "Logcat sniffer exited")
             }
-        }
+            .retry { e ->
+                Log.w(TAG, "Logcat sniffer error: ${e.message}, retrying in 2s...")
+                delay(2000)
+                true
+            }
+            .launchIn(extensionScope)
     }
 
-    private fun parseAntPacket(line: String): BlibAction? {
+    private fun stopLogcatSniffer() {
+        snifferJob?.cancel()
+        snifferJob = null
+    }
+
+    private fun logcatFlow(): Flow<String> = flow {
+        val command = arrayOf("logcat", "-T", "1", "-v", "raw", "-b", "main", "-b", "system", "-b", "radio", "antradio:V", "*:S", "-e", "4E.*02")
+        val process = Runtime.getRuntime().exec(command)
         try {
-            // Split by '[' to get the hex values between brackets
-            // Example: "Rx [A4][11][4E][01][02][39][01][02][01][01][01][00][C0][0A][97][22][05][20][B9][B0][50][35]"
-            val parts = line.split("[").map { it.substringBefore("]").trim() }
-
-            // parts[6]=EventCount, parts[7]=Status
-            if (parts.size < 8) return null
-
-            val eventCount = parts[6].toIntOrNull(16) ?: return null
-            // Debounce the events using the ANT event count byte
-            if (eventCount != lastEventCount) {
-                lastEventCount = eventCount
-                return when (parts[7].toIntOrNull(16)) {
-                    0x01 -> BlibAction.LEFT_PRESS
-                    0x02 -> BlibAction.RIGHT_PRESS
-                    else -> null
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    emit(line)
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(TAG, "Logcat process error", e)
+        } finally {
+            process.destroy()
+            Log.d(TAG, "Logcat process destroyed")
         }
-        return null
-    }
+    }.flowOn(Dispatchers.IO)
 
     private fun handleBlibAction(blibAction: BlibAction) {
         if (!karooSystem.connected) return
 
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastActionTime < 300) return
+        lastActionTime = currentTime
+
         val actionStr = when (blibAction) {
-            BlibAction.LEFT_PRESS -> prefs.getString("left_action", "Page Left")
-            BlibAction.RIGHT_PRESS -> prefs.getString("right_action", "Page Right")
+            BlibAction.LEFT_PRESS -> prefs.getString(KEY_LEFT_ACTION, DEFAULT_LEFT)
+            BlibAction.RIGHT_PRESS -> prefs.getString(KEY_RIGHT_ACTION, DEFAULT_RIGHT)
         } ?: return
 
-        val hardwareAction = mapToAction(actionStr)
-        if (hardwareAction != null) {
+        mapToAction(actionStr)?.let { hardwareAction ->
             val success = karooSystem.dispatch(hardwareAction)
-            Log.d(tag, "Dispatching $hardwareAction Success: $success")
+            Log.d(TAG, "Dispatched $hardwareAction: $success")
         }
     }
 
